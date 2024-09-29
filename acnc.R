@@ -9,11 +9,21 @@ registry <-
 
 beneficiaries <-
   registry |>
-  tidyr::unnest(beneficiaries) |>
-  rename(beneficiary = beneficiaries)
+  unnest(beneficiaries) |>
+  rename(beneficiary = beneficiaries) |>
+  select(abn, beneficiary) |>
+  distinct()
+
+subtypes <-
+  registry |>
+  unnest(subtypes) |>
+  rename(subtype = subtypes) |>
+  select(abn, subtype) |>
+  distinct()
 
 beneficiaries |>
-  inner_join(beneficiaries, by = "abn") |>
+  inner_join(beneficiaries, by = "abn",
+             relationship = "many-to-many") |>
   filter(beneficiary.x < beneficiary.y) |>
   count(beneficiary.x, beneficiary.y) |>
   arrange(desc(n))
