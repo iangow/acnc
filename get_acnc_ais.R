@@ -1,4 +1,6 @@
 library(tidyverse)
+library(readxl)
+library(DBI)
 
 urls <- tribble(
   ~year, ~dataset, ~resource, ~data_file,
@@ -15,8 +17,8 @@ urls <- tribble(
 ) |>
   mutate(url = str_glue("https://data.gov.au/data/",
                         "dataset/{dataset}/",
-                        "resource/{resource}/", "
-                        download/{data_file}"))
+                        "resource/{resource}/",
+                        "download/{data_file}"))
 
 fix_names <- function(df) {
   colnames(df) <- str_replace_all(colnames(df), "[-/\\s]+", "_")
@@ -40,9 +42,9 @@ file_ext <- function(filename) {
 
 get_data <- function(url) {
 
-  t <- tempfile()
-  download.file(url, t)
-
+  t <- basename(url)
+  print(t)
+  if (!file.exists(t)) download.file(url, t)
   pq_name <-
     str_c(
       str_replace(basename(url), "datadotgov_(.*)\\.(csv|xlsx)$", "\\1"),
@@ -54,15 +56,128 @@ get_data <- function(url) {
   pq_path <- file.path(pq_dir, pq_name)
 
   if (file_ext(url) == "xlsx") {
-   df_raw <- readxl::read_xlsx(t) }
-  else if (file_ext(url) == "csv") {
+   df_raw <- read_xlsx(t, na = "N/A", guess_max = 10000)
+   } else if (file_ext(url) == "csv") {
     df_raw <- read_csv(t,
                        col_types = cols(`fundraising number - act` =
                                           col_character()),
                        locale = locale(date_format = "%d/%m/%Y"))
-    }
+   }
 
-  df_raw |>
+  db <- dbConnect(duckdb::duckdb())
+  df_db <- copy_to(db, df = df_raw, overwrite = TRUE)
+
+  if (any(str_detect(colnames(df_db), "Reporting Obligations"))) {
+    reporting_obligs <-
+      df_db |>
+      rename_with(str_to_lower, any_of("ABN")) |>
+      select(abn, matches("Reporting Obligations")) |>
+      pivot_longer(cols = -abn,
+                   names_to = "report_oblig") |>
+      filter(value == "y") |>
+      mutate(report_oblig = str_replace(report_oblig, "^.*\\s+", "")) |>
+      mutate(report_oblig = str_to_upper(report_oblig)) |>
+      group_by(abn) |>
+      summarize(report_oblig = array_agg(report_oblig),
+                .groups = "drop") |>
+      compute()
+  } else {
+    reporting_obligs <- tbl(db, sql("SELECT NULL AS abn"))
+  }
+
+  if (any(str_detect(colnames(df_db), "submitted report"))) {
+    report_submissions <-
+      df_db |>
+      rename_with(str_to_lower, any_of("ABN")) |>
+      select(abn, matches("submitted report ")) |>
+      pivot_longer(cols = -abn,
+                   names_to = "submitted_report") |>
+      filter(value == "y") |>
+      mutate(submitted_report = str_replace(submitted_report, "^.*\\s+", "")) |>
+      mutate(submitted_report = str_to_upper(submitted_report)) |>
+      group_by(abn) |>
+      summarize(submitted_reports = array_agg(submitted_report),
+                .groups = "drop") |>
+      compute()
+  } else {
+    report_submissions <- tbl(db, sql("SELECT NULL AS abn"))
+  }
+
+  if (any(str_detect(colnames(df_db), "association number"))) {
+    assoc_nums <-
+      df_db |>
+      select(abn, matches("association number ")) |>
+      pivot_longer(cols = -abn,
+                   names_to = "state",
+                   values_to = "assoc_num") |>
+      filter(!is.na(assoc_num)) |>
+      mutate(state = str_replace(state, "^.*\\s+", "")) |>
+      mutate(state = str_to_upper(state)) |>
+      compute() |>
+      distinct() |>
+      group_by(abn) |>
+      summarize(states = array_agg(state),
+                assoc_nums = array_agg(assoc_num),
+                .groups = "drop") |>
+      mutate(assoc_nums = map(states, assoc_nums)) |>
+      select(-states) |>
+      compute()
+  } else {
+    assoc_nums <- tbl(db, sql("SELECT NULL AS abn"))
+  }
+
+  if (any(str_detect(colnames(df_db), "fundraising -"))) {
+    fundraising <-
+      df_db |>
+      select(abn, matches("fundraising -")) |>
+      pivot_longer(cols = -abn,
+                   names_to = "state",
+                   values_to = "fundraising") |>
+      filter(fundraising == "y") |>
+      mutate(state = str_replace(state, "^.*\\s+", "")) |>
+      mutate(state = str_to_upper(state)) |>
+      compute() |>
+      group_by(abn) |>
+      summarize(fundraising = array_agg(state),
+                .groups = "drop") |>
+      compute()
+  } else {
+    fundraising <- tbl(db, sql("SELECT NULL AS abn"))
+  }
+
+  if (any(str_detect(colnames(df_db), "fundraising number -"))) {
+    fundraising_nums <-
+      df_db |>
+      select(abn, matches("fundraising number -")) |>
+      compute() |>
+      pivot_longer(cols = -abn,
+                   names_to = "state",
+                   values_to = "fundraising_num") |>
+      compute() |>
+      filter(!is.na(fundraising_num)) |>
+      mutate(state = str_replace(state, "^.*\\s+", "")) |>
+      mutate(state = str_to_upper(state)) |>
+      compute() |>
+      distinct() |>
+      group_by(abn) |>
+      summarize(states = array_agg(state),
+                fundraising_nums = array_agg(fundraising_num),
+                .groups = "drop") |>
+      compute() |>
+      mutate(fundraising_nums = map(states, fundraising_nums)) |>
+      select(-states) |>
+      compute()
+  } else {
+    fundraising_nums <- tbl(db, sql("SELECT NULL AS abn"))
+  }
+
+
+  df_main <-
+    df_raw |>
+    select(-matches("submitted report "),
+           -matches("association number "),
+           -matches("fundraising -"),
+           -matches("fundraising number -")) |>
     fix_names() |>
     mutate(source_file = basename(url),
            across((matches("^date") | matches("_date") |
@@ -72,36 +187,38 @@ get_data <- function(url) {
            type_of_financial_statement =
              if_else(str_detect(type_of_financial_statement, "simplified"),
                      "General purpose, simplified", type_of_financial_statement)) |>
-    arrow::write_parquet(pq_path)
+    copy_to(db, df = _, name = "df_main", overwrite = TRUE)
+
+  df_final <-
+    df_main |>
+    left_join(report_submissions, by = join_by(abn)) |>
+    left_join(assoc_nums, by = join_by(abn)) |>
+    left_join(fundraising, by = join_by(abn)) |>
+    left_join(fundraising_nums, by = join_by(abn)) |>
+    compute(name = "df_final", overwrite = TRUE)
+
+  res <- dbExecute(db, str_c("COPY df_final TO '", pq_path, "'"))
+  dbDisconnect(db)
+  res
 }
 
 map(urls$url, get_data)
 
-ais |> select(matches("(date|^fin_report)"))
-ais |> count(source_file) |> arrange(source_file)
+ais <- copy_to(db, df2)
 
-revocations <-
+
+report_submissions
   ais |>
-  mutate(year = str_c("20",
-                      str_replace(source_file, "datadotgov_ais([0-9]+).(xlsx|csv)", "\\1")),
-         status =
-           case_when(str_detect(registration_status, "Voluntarily") ~ "Voluntarily revoked",
-                     str_detect(registration_status, "Revoked") ~ "Revoked",
-                     registration_status == "Registered" ~ "Registered",
-                     .default = registration_status)) |>
-  filter(registration_status != "Registered") |>
-  mutate(abn = sql("abn::BIGINT")) |>
-  group_by(abn, status) |>
-  summarize(year = min(year, na.rm = TRUE),
-            .groups = "drop") |>
-  compute()
+  select(abn, matches("submitted_report_")) |>
+  pivot_longer(matches("submitted_report_")) |>
 
 
-revocations |> count(status, year) |> arrange(desc(year))
+acnc_main_states <-
+  acnc_main |>
 
 
-datadotgov_ais22 |> count(conducted_activities)
-datadotgov_ais22 |> count(charity_size)
+df1 <- map(urls$url[1], get_data)[[1]]
+df2 <- map(urls$url[2], get_data)[[1]]
 
-colnames(datadotgov_ais22)
-problems(datadotgov_ais22)
+setdiff(colnames(df2), colnames(df1))
+setdiff(colnames(df1), colnames(df2))
